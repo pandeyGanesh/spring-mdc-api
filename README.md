@@ -47,3 +47,19 @@ The `afterCompletion` method is a hook provided by Spring's `HandlerInterceptor`
 Because Spring uses a thread pool, threads are reused. If we didn't manually clear the MDC at the end of the request, we would experience a **ThreadLocal Leak**. 
 
 When `http-nio-8080-exec-1` finishes Request A, the thread goes back to the pool. When Request B comes in and uses `http-nio-8080-exec-1`, the old MDC data from Request A would still be sitting there! Request B would "inherit" Request A's data, causing logs to get mixed up and potentially leaking sensitive data across user requests.
+
+## Spawning Child Threads and Main Thread Lifecycle
+**Scenario**: You populate MDC in a MAIN thread, spawn 10 child threads, copy the MDC context into each child thread, and then the main thread terminates. Will the child threads lose their MDC data?
+
+**Answer**: **No, they will not lose the data.** 
+If you explicitly copy the MDC map (e.g., by capturing `MDC.getCopyOfContextMap()` from the main thread and then applying it via `MDC.setContextMap(...)` in the child threads), each child thread gets its own fully independent map. Because MDC is backed by `ThreadLocal`, the data now belongs to the child thread's local memory. The lifecycle or termination of the main thread has zero impact on the `ThreadLocal` data stored inside the child threads.
+
+## MDC with Asynchronous/Non-blocking I/O
+**Scenario**: In an asynchronous model, a thread is executing Task 1 with populated MDC. Task 1 makes an HTTP call and waits for I/O, yielding the thread back to the pool. The CPU assigns this thread to Task 2. Task 2 finishes and calls `MDC.clear()` via an interceptor. When Task 1 eventually gets a thread back to resume its work, will its MDC values be lost?
+
+**Answer**: **Yes, the MDC values will be lost (or corrupted).**
+MDC is fundamentally tied to the physical **Platform Thread**, not the logical task. If Task 1 yields its thread, and Task 2 takes over that *exact same thread*, Task 2 inherits the `ThreadLocal` state. When Task 2 calls `MDC.clear()`, it wipes the MDC for that physical thread. 
+
+When Task 1 finishes its I/O wait and resumes, it will grab whatever thread is available from the pool. It might be the same thread (which was cleared by Task 2), or a different thread (which might have someone else's MDC or be empty). In either case, Task 1's original MDC context is gone. 
+
+This is the classic pitfall of using standard MDC with reactive programming (like Spring WebFlux) or asynchronous non-blocking code. To solve this, you must either manually propagate the context whenever a task resumes on a thread, or rely on framework-specific context propagation tools (like Reactor Context or Micrometer Tracing) which handle moving the context across thread boundaries automatically.
